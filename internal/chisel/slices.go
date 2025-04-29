@@ -1,0 +1,73 @@
+package chisel
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+type Slice struct {
+	Name      string   `yaml:"-"`
+	Essential []string `yaml:"essential,omitempty"`
+}
+
+type sliceDef struct {
+	Package   string           `yaml:"package"`
+	Essential []string         `yaml:"essential,omitempty"`
+	Slices    map[string]Slice `yaml:"slices"`
+}
+
+// Parse all slices from a slice definition file.
+func ParseSlices(path string) ([]*Slice, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	def := &sliceDef{}
+	d := yaml.NewDecoder(f)
+	if err := d.Decode(def); err != nil {
+		return nil, err
+	}
+
+	if def.Package == "" {
+		return nil, fmt.Errorf("missing 'package' field")
+	}
+	for _, s := range def.Essential {
+		if _, _, err := Parse(s); err != nil {
+			return nil, err
+		}
+	}
+
+	var slices []*Slice
+	for name, slice := range def.Slices {
+		for _, e := range slice.Essential {
+			if _, _, err := Parse(e); err != nil {
+				return nil, err
+			}
+		}
+		slice.Essential = append(slice.Essential, def.Essential...)
+		slice.Name = Name(def.Package, name)
+		slices = append(slices, &slice)
+	}
+	return slices, nil
+}
+
+func Name(pkg, slice string) string {
+	return pkg + "_" + slice
+}
+
+func Parse(name string) (pkg, slice string, err error) {
+	i := strings.Index(name, "_")
+	if i < 0 {
+		return "", "", fmt.Errorf("invalid slice name: %s", name)
+	}
+	pkg, slice = name[:i], name[i+1:]
+	if strings.Contains(slice, "_") {
+		return "", "", fmt.Errorf("invalid slice name: %s", name)
+	}
+	return pkg, slice, nil
+}
