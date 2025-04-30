@@ -12,6 +12,7 @@ import (
 type cmdInstall struct {
 	Arch    []string `short:"a" long:"arch" description:"Package architecture"`
 	Release string   `short:"r" long:"release" description:"Chisel release path" required:"true"`
+	Combine bool     `short:"c" long:"combine" description:"Install all slices together"`
 	Prune   bool     `short:"p" long:"prune" description:"Install a slice once"`
 	Worker  int      `short:"w" long:"worker" description:"Number of concurrent workers" default:"10"`
 	Args    struct {
@@ -48,7 +49,7 @@ func (c *cmdInstall) Execute(args []string) error {
 		}
 		sliceDefs = append(sliceDefs, defs...)
 	}
-	if c.Prune {
+	if c.Prune && !c.Combine {
 		sliceDefs = prune(sliceDefs)
 	}
 	return c.installSlices(sliceDefs)
@@ -91,11 +92,22 @@ func (c *cmdInstall) installSlices(sliceDefs []*chisel.Slice) error {
 	}
 
 	for _, a := range c.Arch {
-		for _, s := range sliceDefs {
-			tasks <- &task{
-				slice:   s.Name,
+		if c.Combine {
+			t := &task{
 				arch:    a,
 				release: c.Release,
+			}
+			for _, s := range sliceDefs {
+				t.slices = append(t.slices, s.Name)
+			}
+			tasks <- t
+		} else {
+			for _, s := range sliceDefs {
+				tasks <- &task{
+					slices:  []string{s.Name},
+					arch:    a,
+					release: c.Release,
+				}
 			}
 		}
 	}
@@ -116,7 +128,7 @@ func (c *cmdInstall) installSlices(sliceDefs []*chisel.Slice) error {
 }
 
 type task struct {
-	slice   string
+	slices  []string
 	arch    string
 	release string
 }
@@ -136,23 +148,24 @@ func do(tasks <-chan *task, errs chan<- error, done chan<- bool) {
 		}
 
 		if opts.Verbose {
-			fmt.Fprintf(os.Stderr, "installing %s slice for %s arch...\n",
-				task.slice, task.arch)
+			fmt.Fprintf(os.Stderr, "installing %s on %s...\n",
+				task.slices, task.arch)
 		}
 
-		cmd := exec.Command(
-			"chisel",
+		args := []string{
 			"cut",
 			"--release", task.release,
 			"--arch", task.arch,
 			"--root", root,
-			task.slice,
-		)
+		}
+		args = append(args, task.slices...)
+		cmd := exec.Command("chisel", args...)
+
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "[SUCCESS] installed %s slice on %s\n",
-					task.slice, task.arch)
+				fmt.Fprintf(os.Stderr, "[SUCCESS] installed %s on %s\n",
+					task.slices, task.arch)
 			}
 			continue
 		}
@@ -165,7 +178,7 @@ func do(tasks <-chan *task, errs chan<- error, done chan<- bool) {
 			"===========================================\n"+
 			"%s\n"+
 			"===========================================\n",
-			task.slice, task.arch, output,
+			task.slices, task.arch, output,
 		)
 	}
 	done <- true
