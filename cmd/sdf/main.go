@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/jessevdk/go-flags"
@@ -10,9 +11,7 @@ import (
 // ErrExtraArgs is returned  if extra arguments to a command are found
 var ErrExtraArgs = fmt.Errorf("too many arguments for command")
 
-type parseOptions struct {
-	Verbose bool `short:"v" long:"verbose" description:"Verbosity level"`
-}
+type parseOptions struct{}
 
 var (
 	opts   parseOptions
@@ -20,6 +19,9 @@ var (
 )
 
 func main() {
+	// We do not care for any date/time prefix on the logs.
+	log.SetFlags(0)
+
 	if _, err := parser.Parse(); err != nil {
 		switch flagsErr := err.(type) {
 		case flags.ErrorType:

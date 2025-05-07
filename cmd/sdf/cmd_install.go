@@ -1,23 +1,33 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"math/rand/v2"
+	"log"
 	"os"
 	"os/exec"
+	"strings"
+	"sync"
 
 	"github.com/rebornplusplus/chisel-tools/internal/chisel"
 )
 
 type cmdInstall struct {
-	Arch    []string `short:"a" long:"arch" description:"Package architecture"`
-	Release string   `short:"r" long:"release" description:"Chisel release path" required:"true"`
-	Combine bool     `short:"c" long:"combine" description:"Install all slices together"`
-	Prune   bool     `short:"p" long:"prune" description:"Install a slice once"`
-	Worker  int      `short:"w" long:"worker" description:"Number of concurrent workers" default:"10"`
-	Args    struct {
+	Release string `short:"r" long:"release" description:"Chisel release path" required:"true"`
+	Arch    string `short:"a" long:"arch" description:"Package architecture" default:"amd64"`
+
+	Combine bool `long:"combine" description:"Install all slices in one go"`
+	Prune   bool `long:"prune" description:"Install only the top level slices"`
+
+	Workers  int  `short:"w" long:"workers" description:"Number of concurrent workers" default:"10"`
+	Continue bool `short:"c" long:"continue-on-error" description:"Continue on installation errors"`
+
+	Ignore bool `long:"ignore-missing" description:"Ignore missing packages for an arch"`
+	Ensure bool `long:"ensure-existence" description:"Ensure package existence for at least one arch"`
+
+	Args struct {
 		Files []string `positional-arg-name:"slice definition files"`
-	} `positional-args:"yes"`
+	} `positional-args:"yes" required:"true"`
 }
 
 func init() {
@@ -33,153 +43,162 @@ func (c *cmdInstall) Execute(args []string) error {
 	if len(args) > 0 {
 		return ErrExtraArgs
 	}
-	if len(c.Args.Files) == 0 {
-		return nil
+	if c.Workers <= 0 {
+		return fmt.Errorf("invalid value for --workers: %d", c.Workers)
 	}
-	if len(c.Arch) == 0 {
-		c.Arch = []string{"amd64"}
+	for _, f := range c.Args.Files {
+		if !strings.HasPrefix(f, c.Release) {
+			return fmt.Errorf("file %s is not inside release %s", f, c.Release)
+		}
+	}
+	if len(c.Args.Files) == 0 {
+		return nil // There is nothing to do.
 	}
 
-	var sliceDefs []*chisel.Slice
+	var slices []*chisel.Slice
 	for _, f := range c.Args.Files {
-		defs, err := chisel.ParseSlices(f)
+		s, err := chisel.ParseSlices(f)
 		if err != nil {
-			return fmt.Errorf("cannot parse slice definition file %s: %w",
-				f, err)
+			return fmt.Errorf("cannot parse slices from file %s: %w", f, err)
 		}
-		sliceDefs = append(sliceDefs, defs...)
+		slices = append(slices, s...)
 	}
-	if c.Prune && !c.Combine {
-		sliceDefs = prune(sliceDefs)
+
+	if c.Prune {
+		slices = prune(slices)
 	}
-	return c.installSlices(sliceDefs)
+
+	g := group(slices, c.Combine)
+	return c.install(g)
 }
 
-func prune(sliceDefs []*chisel.Slice) []*chisel.Slice {
-	// Shuffle the slice.
-	defs := make([]*chisel.Slice, len(sliceDefs))
-	perm := rand.Perm(len(sliceDefs))
-	for i, v := range perm {
-		defs[v] = sliceDefs[i]
-	}
-	// If a slice is going to be installed as an essential, do not install it a
-	// second time on it's own.
-	pending := make(map[string]bool)
-	for _, s := range defs {
-		pending[s.Name] = true
-	}
-	var todo []*chisel.Slice
-	for _, s := range defs {
-		if _, ok := pending[s.Name]; !ok {
-			continue
+// Group slices for installation. If combine is true, create only one group with
+// all slices in it.
+func group(slices []*chisel.Slice, combine bool) [][]string {
+	var grouped [][]string
+	if combine {
+		var names []string
+		for _, s := range slices {
+			names = append(names, s.Name)
 		}
-		todo = append(todo, s)
+		grouped = append(grouped, names)
+	} else {
+		for _, s := range slices {
+			grouped = append(grouped, []string{s.Name})
+		}
+	}
+	return grouped
+}
+
+// Prune the list of slices and return only the top-level slices that no slice
+// depends on. Installing these slices alone should cover all of the slices.
+// It depends on the acyclic dependency policy of chisel slices.
+func prune(slices []*chisel.Slice) []*chisel.Slice {
+	log.Print("Pruning the list of slices...")
+
+	pending := make(map[string]*chisel.Slice)
+	for _, s := range slices {
+		pending[s.Name] = s
+	}
+	for _, s := range slices {
 		for _, e := range s.Essential {
 			delete(pending, e)
 		}
 	}
+	var todo []*chisel.Slice
+	for _, s := range pending {
+		todo = append(todo, s)
+	}
 	return todo
 }
 
-func (c *cmdInstall) installSlices(sliceDefs []*chisel.Slice) error {
-	nTasks := len(c.Arch) * len(sliceDefs)
-	tasks := make(chan *task, nTasks)
-	errs := make(chan error, nTasks)
-	done := make(chan bool, c.Worker)
+// Install the groups of slices, concurrently.
+func (c *cmdInstall) install(slices [][]string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	for i := 0; i < c.Worker; i++ {
-		go do(tasks, errs, done)
-	}
-
-	for _, a := range c.Arch {
-		if c.Combine {
-			t := &task{
-				arch:    a,
-				release: c.Release,
-			}
-			for _, s := range sliceDefs {
-				t.slices = append(t.slices, s.Name)
-			}
-			tasks <- t
-		} else {
-			for _, s := range sliceDefs {
-				tasks <- &task{
-					slices:  []string{s.Name},
-					arch:    a,
-					release: c.Release,
-				}
-			}
+	tasks := make(chan *task, len(slices)) // Tasks to finish.
+	errs := make(chan error, len(slices))  // Errors from the tasks, if any.
+	for _, s := range slices {
+		tasks <- &task{
+			args:   []string{"cut", "--release", c.Release, "--arch", c.Arch},
+			slices: s,
 		}
 	}
 	close(tasks)
 
-	var finished int
-	for finished < c.Worker {
+	done := make(chan bool) // Indicates that the workers are done.
+	var wg sync.WaitGroup
+	for range min(c.Workers, len(slices)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker(ctx, tasks, errs)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		done <- true
+	}()
+
+loop:
+	for {
 		select {
-		case err := <-errs:
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-			}
 		case <-done:
-			finished++
+			break loop
+		case <-errs:
+			if !c.Continue {
+				cancel()
+			}
 		}
 	}
+
 	return nil
 }
 
 type task struct {
-	slices  []string
-	arch    string
-	release string
+	args   []string // Chisel arguments without positional slice name(s).
+	slices []string // Positional argument - slice name(s) to install.
 }
 
-func do(tasks <-chan *task, errs chan<- error, done chan<- bool) {
-	dir, err := os.MkdirTemp("", "")
-	if err != nil {
-		errs <- fmt.Errorf("cannot create temp directory: %w", err)
-	}
-	defer os.RemoveAll(dir)
+func worker(ctx context.Context, tasks <-chan *task, errs chan<- error) {
+	do := func(task *task) {
+		name := strings.Join(task.slices, " ")
+		log.Printf("Installing %s...", name)
 
-	for task := range tasks {
-		root, err := os.MkdirTemp(dir, "chisel-")
+		dir, err := os.MkdirTemp("", "")
 		if err != nil {
-			errs <- fmt.Errorf("cannot create temp directory: %w", err)
-			continue
+			// Should not happen, but let's be nice and log if it happens.
+			log.Printf("[NO] Failed to install %s: %s", name, err)
+			errs <- err
+			return
 		}
+		defer os.RemoveAll(dir)
 
-		if opts.Verbose {
-			fmt.Fprintf(os.Stderr, "installing %s on %s...\n",
-				task.slices, task.arch)
-		}
-
-		args := []string{
-			"cut",
-			"--release", task.release,
-			"--arch", task.arch,
-			"--root", root,
-		}
+		args := append(task.args, "--root", dir)
 		args = append(args, task.slices...)
-		cmd := exec.Command("chisel", args...)
 
-		output, err := cmd.CombinedOutput()
-		if err == nil {
-			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "[SUCCESS] installed %s on %s\n",
-					task.slices, task.arch)
+		cmd := exec.CommandContext(ctx, "chisel", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			if e, ok := err.(*exec.ExitError); ok && e.ProcessState.ExitCode() != -1 {
+				log.Printf("[NO] Failed to install %s: %s\n%s", name, err, out)
 			}
-			continue
+			errs <- err
+		} else {
+			log.Printf("[OK] Installed %s", name)
 		}
-
-		if _, ok := err.(*exec.ExitError); !ok {
-			errs <- fmt.Errorf("cannot execute process: %w", err)
-			continue
-		}
-		fmt.Fprintf(os.Stderr, "[FAILED] could not install %s on %s:\n"+
-			"===========================================\n"+
-			"%s\n"+
-			"===========================================\n",
-			task.slices, task.arch, output,
-		)
 	}
-	done <- true
+
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			break loop // Context cancelled. Quit.
+		case task, ok := <-tasks:
+			if !ok {
+				break loop // No more tasks. Quit.
+			}
+			do(task)
+		}
+	}
 }

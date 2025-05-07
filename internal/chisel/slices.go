@@ -8,6 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// The interesting bits about a chisel slice.
 type Slice struct {
 	Name      string   `yaml:"-"`
 	Essential []string `yaml:"essential,omitempty"`
@@ -36,9 +37,12 @@ func ParseSlices(path string) ([]*Slice, error) {
 	if def.Package == "" {
 		return nil, fmt.Errorf("missing 'package' field")
 	}
+	if len(def.Slices) == 0 {
+		return nil, fmt.Errorf("missing 'slices' field")
+	}
 	for _, s := range def.Essential {
 		if _, _, err := Parse(s); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("'essential': %w", err)
 		}
 	}
 
@@ -46,7 +50,7 @@ func ParseSlices(path string) ([]*Slice, error) {
 	for name, slice := range def.Slices {
 		for _, e := range slice.Essential {
 			if _, _, err := Parse(e); err != nil {
-				return nil, err
+				return nil, fmt.Errorf("slice %s 'essential': %w", name, err)
 			}
 		}
 		slice.Essential = append(slice.Essential, def.Essential...)
