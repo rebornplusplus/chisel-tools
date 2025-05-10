@@ -6,26 +6,35 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rebornplusplus/chisel-tools/internal/chisel"
+	"github.com/rebornplusplus/chisel-tools/internal/rmadison"
+)
+
+const (
+	tick  = '\u2713'
+	cross = '\u2717'
 )
 
 type cmdInstall struct {
 	Release string `short:"r" long:"release" description:"Chisel release path" required:"true"`
 	Arch    string `short:"a" long:"arch" description:"Package architecture" default:"amd64"`
+	Workers int    `short:"w" long:"workers" description:"Number of concurrent workers" default:"10"`
 
+	// You may use [Combine] and [Prune] together. The slices will be pruned
+	// first and then combined to install only the top level slices in one go.
 	Combine bool `long:"combine" description:"Install all slices in one go"`
 	Prune   bool `long:"prune" description:"Install only the top level slices"`
 
-	Workers  int  `short:"w" long:"workers" description:"Number of concurrent workers" default:"10"`
 	Continue bool `short:"c" long:"continue-on-error" description:"Continue on installation errors"`
+	Ignore   bool `long:"ignore-missing" description:"Ignore missing packages for an arch"`
+	Ensure   bool `long:"ensure-existence" description:"Ensure package existence for at least one arch"`
 
-	Ignore bool `long:"ignore-missing" description:"Ignore missing packages for an arch"`
-	Ensure bool `long:"ensure-existence" description:"Ensure package existence for at least one arch"`
-
-	Args struct {
+	Positional struct {
 		Files []string `positional-arg-name:"slice definition files"`
 	} `positional-args:"yes" required:"true"`
 }
@@ -46,22 +55,35 @@ func (c *cmdInstall) Execute(args []string) error {
 	if c.Workers <= 0 {
 		return fmt.Errorf("invalid value for --workers: %d", c.Workers)
 	}
-	for _, f := range c.Args.Files {
-		if !strings.HasPrefix(f, c.Release) {
-			return fmt.Errorf("file %s is not inside release %s", f, c.Release)
-		}
-	}
-	if len(c.Args.Files) == 0 {
+	if len(c.Positional.Files) == 0 {
 		return nil // There is nothing to do.
 	}
 
 	var slices []*chisel.Slice
-	for _, f := range c.Args.Files {
+	for _, f := range c.Positional.Files {
 		s, err := chisel.ParseSlices(f)
 		if err != nil {
 			return fmt.Errorf("cannot parse slices from file %s: %w", f, err)
 		}
 		slices = append(slices, s...)
+	}
+
+	// "Ensure" and "Ignore" packages before pruning the slices, because once
+	// pruned, some packages may completely be omitted from these checks.
+	if c.Ensure || c.Ignore {
+		pkgInfo, err := c.queryArchive(slices)
+		if err != nil {
+			return err
+		}
+		if c.Ensure {
+			if err := ensurePackages(slices, pkgInfo); err != nil {
+				log.Printf("%c Could not ensure packages: %s", cross, err)
+				// Only logging the error here without quiting.
+			}
+		}
+		if c.Ignore {
+			slices = ignoreMissing(slices, pkgInfo, c.Arch)
+		}
 	}
 
 	if c.Prune {
@@ -106,14 +128,19 @@ func prune(slices []*chisel.Slice) []*chisel.Slice {
 		}
 	}
 	var todo []*chisel.Slice
-	for _, s := range pending {
-		todo = append(todo, s)
+	for _, s := range slices {
+		if _, ok := pending[s.Name]; ok {
+			todo = append(todo, s)
+		}
 	}
 	return todo
 }
 
 // Install the groups of slices, concurrently.
 func (c *cmdInstall) install(slices [][]string) error {
+	if len(slices) == 0 {
+		log.Printf("%c Nothing to install :)", tick)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -161,6 +188,10 @@ type task struct {
 	slices []string // Positional argument - slice name(s) to install.
 }
 
+// worker does the actual installation of a list of slices by executing the
+// chisel cut command in another process.
+// It takes in a context to interrupt when necessary, a stream (channel) of
+// tasks and a channel to send errors to.
 func worker(ctx context.Context, tasks <-chan *task, errs chan<- error) {
 	do := func(task *task) {
 		name := strings.Join(task.slices, " ")
@@ -169,7 +200,7 @@ func worker(ctx context.Context, tasks <-chan *task, errs chan<- error) {
 		dir, err := os.MkdirTemp("", "")
 		if err != nil {
 			// Should not happen, but let's be nice and log if it happens.
-			log.Printf("[NO] Failed to install %s: %s", name, err)
+			log.Printf("%c Failed to install %s: %s", cross, name, err)
 			errs <- err
 			return
 		}
@@ -181,11 +212,11 @@ func worker(ctx context.Context, tasks <-chan *task, errs chan<- error) {
 		cmd := exec.CommandContext(ctx, "chisel", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			if e, ok := err.(*exec.ExitError); ok && e.ProcessState.ExitCode() != -1 {
-				log.Printf("[NO] Failed to install %s: %s\n%s", name, err, out)
+				log.Printf("%c Failed to install %s: %s\n%s", cross, name, err, out)
 			}
 			errs <- err
 		} else {
-			log.Printf("[OK] Installed %s", name)
+			log.Printf("%c Installed %s", tick, name)
 		}
 	}
 
@@ -201,4 +232,80 @@ loop:
 			do(task)
 		}
 	}
+}
+
+// Query the archives for package existence, using the chisel.yaml
+// configurations.
+func (c *cmdInstall) queryArchive(slices []*chisel.Slice) (map[string]*rmadison.Result, error) {
+	p := filepath.Join(c.Release, "chisel.yaml")
+	cfg, err := chisel.ParseConfig(p)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse chisel.yaml: %w", err)
+	}
+	ubuntu, ok := cfg.Archives["ubuntu"]
+	if !ok {
+		return nil, fmt.Errorf("no 'ubuntu' archive in chisel.yaml")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var pkgs []string
+	exists := make(map[string]struct{})
+	for _, s := range slices {
+		if _, ok := exists[s.Package]; !ok {
+			pkgs = append(pkgs, s.Package)
+			exists[s.Package] = struct{}{}
+		}
+	}
+	res, err := rmadison.QueryWithContext(ctx, &rmadison.QueryOptions{
+		Component: ubuntu.Components,
+		Suite:     ubuntu.Suites,
+		Package:   pkgs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cannot query archives: %w", err)
+	}
+	pkgInfo := make(map[string]*rmadison.Result)
+	for _, r := range res {
+		pkgInfo[r.Package] = r
+	}
+	return pkgInfo, nil
+}
+
+// Ensure that the slice packages exist for at least one arch.
+func ensurePackages(slices []*chisel.Slice, pkgInfo map[string]*rmadison.Result) error {
+	log.Println("Ensuring slice packages existence...")
+	for _, s := range slices {
+		if _, ok := pkgInfo[s.Package]; !ok {
+			return fmt.Errorf("package %q does not exist", s.Package)
+		}
+	}
+	return nil
+}
+
+// Ignore missing slice packages for a particular arch.
+func ignoreMissing(slices []*chisel.Slice, pkgInfo map[string]*rmadison.Result, arch string) []*chisel.Slice {
+	log.Printf("Ignoring missing slice packages on %s...", arch)
+	var found []*chisel.Slice
+	missing := make(map[string]bool)
+	for _, s := range slices {
+		// Use the missing map to avoid costly [strings.Contains] operation
+		// below for all slices of a package.
+		if miss, ok := missing[s.Package]; ok {
+			if !miss {
+				found = append(found, s)
+			}
+			continue
+		}
+		info, ok := pkgInfo[s.Package]
+		if ok && (strings.Contains(info.Arch, arch) || strings.Contains(info.Arch, "all")) {
+			found = append(found, s)
+			missing[s.Package] = false
+			continue
+		}
+		log.Printf("... ignored %s for %s", s.Package, arch)
+		missing[s.Package] = true
+	}
+	return found
 }

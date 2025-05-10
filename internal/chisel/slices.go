@@ -3,6 +3,7 @@ package chisel
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -11,7 +12,9 @@ import (
 // The interesting bits about a chisel slice.
 type Slice struct {
 	Name      string   `yaml:"-"`
+	Package   string   `yaml:"-"`
 	Essential []string `yaml:"essential,omitempty"`
+	// TODO add remaining fields when necessary.
 }
 
 type sliceDef struct {
@@ -55,8 +58,12 @@ func ParseSlices(path string) ([]*Slice, error) {
 		}
 		slice.Essential = append(slice.Essential, def.Essential...)
 		slice.Name = Name(def.Package, name)
+		slice.Package = def.Package
 		slices = append(slices, &slice)
 	}
+	sort.Slice(slices, func(i, j int) bool {
+		return slices[i].Name < slices[j].Name
+	})
 	return slices, nil
 }
 

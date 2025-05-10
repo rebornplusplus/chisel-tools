@@ -34,11 +34,13 @@ var sliceData = []struct {
 	summary: "Sample slice definition file",
 	data:    sampleSlice,
 	slices: []*chisel.Slice{{
-		Name:      "foo_foo",
-		Essential: []string{"bar_bar", "bar_foo"},
-	}, {
 		Name:      "foo_bar",
+		Package:   "foo",
 		Essential: []string{"foo_foo", "buz_foo", "bar_foo"},
+	}, {
+		Name:      "foo_foo",
+		Package:   "foo",
+		Essential: []string{"bar_bar", "bar_foo"},
 	}},
 }}
 
