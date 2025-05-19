@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -165,22 +166,30 @@ func (c *cmdInstall) install(slices [][]string) error {
 	}
 	go func() {
 		wg.Wait()
+		// Wait 1 second before sending the done signal as the workers might
+		// send an error to the "errs" channel at the same time.
+		time.Sleep(1 * time.Second)
 		done <- true
 	}()
 
+	var allErrs error
 loop:
 	for {
 		select {
 		case <-done:
 			break loop
-		case <-errs:
+		case err := <-errs:
+			if err == nil {
+				continue
+			}
 			if !c.Continue {
 				cancel()
+				return err
 			}
+			allErrs = errors.Join(allErrs, err)
 		}
 	}
-
-	return nil
+	return allErrs
 }
 
 type task struct {
@@ -200,7 +209,8 @@ func worker(ctx context.Context, tasks <-chan *task, errs chan<- error) {
 		dir, err := os.MkdirTemp("", "")
 		if err != nil {
 			// Should not happen, but let's be nice and log if it happens.
-			log.Printf("%c Failed to install %s: %s", cross, name, err)
+			err = fmt.Errorf("%c Failed to install %s: %w", cross, name, err)
+			log.Println(err)
 			errs <- err
 			return
 		}
@@ -212,7 +222,8 @@ func worker(ctx context.Context, tasks <-chan *task, errs chan<- error) {
 		cmd := exec.CommandContext(ctx, "chisel", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			if e, ok := err.(*exec.ExitError); ok && e.ProcessState.ExitCode() != -1 {
-				log.Printf("%c Failed to install %s: %s\n%s", cross, name, err, out)
+				err = fmt.Errorf("%c Failed to install %s: %w", cross, name, err)
+				log.Printf("%s\n%s", err, out)
 			}
 			errs <- err
 		} else {

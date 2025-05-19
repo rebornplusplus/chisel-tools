@@ -11,12 +11,7 @@ import (
 // ErrExtraArgs is returned  if extra arguments to a command are found
 var ErrExtraArgs = fmt.Errorf("too many arguments for command")
 
-type parseOptions struct{}
-
-var (
-	opts   parseOptions
-	parser = flags.NewParser(&opts, flags.Default)
-)
+var parser = flags.NewParser(&struct{}{}, flags.Default)
 
 func main() {
 	// We do not care for any date/time prefix on the logs.
