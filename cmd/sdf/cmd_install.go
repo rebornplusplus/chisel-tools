@@ -78,8 +78,7 @@ func (c *cmdInstall) Execute(args []string) error {
 		}
 		if c.Ensure {
 			if err := ensurePackages(slices, pkgInfo); err != nil {
-				log.Printf("%c Could not ensure packages: %s", cross, err)
-				// Only logging the error here without quiting.
+				return fmt.Errorf("%c Could not ensure packages: %s", cross, err)
 			}
 		}
 		if c.Ignore {
