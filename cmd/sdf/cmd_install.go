@@ -202,16 +202,34 @@ type task struct {
 // It takes in a context to interrupt when necessary, a stream (channel) of
 // tasks and a channel to send errors to.
 func worker(ctx context.Context, tasks <-chan *task, errs chan<- error) {
+	// We are using an independent cache directory for chisel in each worker.
+	// The reason is tricky to detect. When creating files in cache, Chisel
+	// temporary saves a file as "<digest>.tmp" in the cache directory.[^1]
+	// It later renames the file to "<digest>" within the same directory.[^2]
+	// This is OK, if two chisel operations are sequential and/or do not try to
+	// "create" the cache at the same time. But on concurrent operations, the
+	// second process fails to rename the temporary file and eventually fails.
+	//
+	//   error: cannot fetch from archive: rename
+	//   /home/runner/.cache/chisel/sha256/6b8cc68643d18250ab297c4f6d427a8778b1d1534e1a3033fff0f221fa20a419.tmp
+	//   /home/runner/.cache/chisel/sha256/6b8cc68643d18250ab297c4f6d427a8778b1d1534e1a3033fff0f221fa20a419:
+	//   no such file or directory
+	//
+	// [^1]: https://github.com/canonical/chisel/blob/main/internal/cache/cache.go#L112
+	// [^2]: https://github.com/canonical/chisel/blob/main/internal/cache/cache.go#L80
+	cacheDir, err := os.MkdirTemp("", "")
+	if err != nil {
+		errs <- fmt.Errorf("cannot create temporary directory: %w", err)
+		return
+	}
+
 	do := func(task *task) {
 		name := strings.Join(task.slices, " ")
 		log.Printf("Installing %s...", name)
 
 		dir, err := os.MkdirTemp("", "")
 		if err != nil {
-			// Should not happen, but let's be nice and log if it happens.
-			err = fmt.Errorf("%c Failed to install %s: %w", cross, name, err)
-			log.Println(err)
-			errs <- err
+			errs <- fmt.Errorf("cannot create temporary directory: %w", err)
 			return
 		}
 		defer os.RemoveAll(dir)
@@ -220,6 +238,9 @@ func worker(ctx context.Context, tasks <-chan *task, errs chan<- error) {
 		args = append(args, task.slices...)
 
 		cmd := exec.CommandContext(ctx, "chisel", args...)
+		cmd.Env = os.Environ()
+		cmd.Env = append(cmd.Env, "XDG_CACHE_HOME="+cacheDir)
+
 		if out, err := cmd.CombinedOutput(); err != nil {
 			if e, ok := err.(*exec.ExitError); ok && e.ProcessState.ExitCode() != -1 {
 				err = fmt.Errorf("%c Failed to install %s: %w", cross, name, err)
